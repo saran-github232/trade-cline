@@ -450,3 +450,185 @@ def tag_experience(experience, context) -> Tuple[str, ...]
 * Run `python3 -m unittest discover -s tests -v` before declaring done.
 * No network access in tests. No hard-coded credentials. No `pickle`.
 * Do not edit files outside your assigned ownership list.
+
+---
+
+## 14. Strategy protocol (decouples the backtester from the pipeline)
+
+The backtester NEVER imports the feature/model/ensemble code directly. It is
+given a strategy callable, which keeps leakage testing honest: the strategy
+can only see what the replay step hands it.
+
+```python
+# market_ai/backtest/engine.py
+class Strategy(Protocol):
+    name: str
+    def predict(self, step: "ReplayStep") -> "Prediction": ...
+```
+
+The engine calls `strategy.predict(step)` once per replay step. The strategy
+receives `step.history` (strictly causal) and must NOT access `step.future`.
+The engine itself is the only component allowed to read `step.future`, and it
+does so solely to resolve outcomes.
+
+A `VariantStrategy` wrapper lets the engine compare BASELINE / TECHNICAL_ONLY
+/ ML_ONLY / VISION_ONLY / ENSEMBLE from one factory:
+
+```python
+# market_ai/backtest/variants.py
+def make_variant_strategy(variant: str, config: Config | None = None,
+                          **kwargs) -> Strategy
+def available_variants() -> List[str]      # baseline, technical, ml, vision, ensemble
+```
+
+The `baseline` variant is a deliberately naive rule (e.g. always predict the
+sign of the last bar) so that any real signal must beat it to be interesting.
+
+---
+
+## 15. Training / retraining (`market_ai.training`, `market_ai.retraining`)
+
+```python
+# training/dataset.py
+@dataclass
+class Dataset:
+    dataset_version: str
+    feature_names: List[str]
+    X: List[List[float]]
+    y: List[int]
+    timestamps: List[int]
+    regimes: List[str]
+    meta: Dict[str, Any]
+    def to_dict(self) -> Dict[str, Any]
+
+def label_from_outcome(decision: Decision, actual: Direction) -> int   # 1 = UP, 0 = DOWN
+
+def build_dataset(experiences: Sequence[Experience], *,
+                  feature_names: Sequence[str] | None = None,
+                  min_samples: int = 50) -> Dataset
+
+def build_dataset_from_replay(series: MarketSeries, engine, *, ...) -> Dataset
+
+class DatasetBuilder:
+    def __init__(self, config=None): ...
+    def from_experiences(self, experiences) -> Dataset
+    def from_series(self, series: MarketSeries, *, horizon_bars: int = 3) -> Dataset
+
+# training/pipeline.py
+@dataclass
+class TrainingResult:
+    model_version: str
+    model_name: str
+    params: Dict[str, Any]
+    metrics: Dict[str, Any]
+    calibration: Dict[str, Any]
+    feature_importance: Dict[str, float]
+    train_period: Tuple[int, int]
+    validation_period: Tuple[int, int]
+    test_period: Tuple[int, int]
+    folds: List[Dict[str, Any]]
+
+class TrainingPipeline:
+    def __init__(self, config=None, *, registry=None): ...
+    def train(self, dataset: Dataset, *, model_name: str = "gradient_boosting",
+              params: Dict[str, Any] | None = None,
+              version_prefix: str = "challenger") -> TrainingResult
+
+# training/validation.py
+def walk_forward_evaluate(dataset, *, model_name, params=None, n_folds=5,
+                          config=None) -> Dict[str, Any]
+def calibration_curve(probs, y, n_bins=10) -> Dict[str, Any]
+```
+
+---
+
+## 16. Retraining / promotion (`market_ai.retraining`)
+
+```python
+# retraining/policy.py
+@dataclass
+class RetrainDecision:
+    should_retrain: bool
+    reasons: List[str]
+    priority: str            # "low" | "normal" | "high"
+    def to_dict(self) -> Dict[str, Any]
+
+class RetrainingPolicy:
+    def __init__(self, config=None): ...
+    def evaluate(self, *, experiences, champion_metrics, last_trained_at,
+                 now=None) -> RetrainDecision
+
+# retraining/promotion.py
+@dataclass
+class PromotionDecision:
+    promote: bool
+    gates: Dict[str, bool]
+    details: Dict[str, Any]
+    reasons: List[str]
+    def to_dict(self) -> Dict[str, Any]
+
+class ModelPromotionEngine:
+    def __init__(self, config=None, *, registry=None): ...
+    def evaluate(self, *, challenger: TrainingResult, champion: TrainingResult | None,
+                 challenger_oos: Dict[str, Any], champion_oos: Dict[str, Any] | None,
+                 regression_passed: bool = True) -> PromotionDecision
+    def promote(self, challenger_version: str, decision: PromotionDecision) -> str
+
+# retraining/jobs.py
+class RetrainingJob:
+    """Orchestrates: gather experiences -> build dataset -> train challenger ->
+    walk-forward validate -> compare vs champion -> promote or reject."""
+    def __init__(self, config=None, *, store=None, registry=None, training=None, promotion=None): ...
+    def run(self, *, experiences=None, force: bool = False) -> Dict[str, Any]
+```
+
+---
+
+## 17. Risk and paper trading (`market_ai.risk`, `market_ai.paper_trading`)
+
+```python
+# risk/manager.py
+@dataclass
+class RiskDecision:
+    allowed: bool
+    stake: float
+    reasons: List[str]
+    def to_dict(self) -> Dict[str, Any]
+
+class RiskManager:
+    def __init__(self, config=None): ...
+    def approve(self, *, balance: float, decision: Decision, confidence: float,
+                day_pnl: float, consecutive_losses: int, trades_today: int) -> RiskDecision
+    def reset_day(self) -> None
+
+# paper_trading/engine.py
+@dataclass
+class PaperTrade:
+    trade_id: str
+    prediction_id: str
+    opened_at: int
+    asset: str
+    timeframe: Timeframe
+    decision: Decision
+    confidence: float
+    entry: float
+    expiration: int
+    stake: float
+    outcome: str = "OPEN"
+    pnl: float = 0.0
+    balance_after: float = 0.0
+    model_version: str = "unknown"
+    def to_dict(self) -> Dict[str, Any]
+
+class PaperTradingEngine:
+    def __init__(self, config=None, *, db=None): ...
+    def on_prediction(self, prediction: Prediction) -> PaperTrade | None
+    def settle(self, prediction: Prediction, outcome: Outcome) -> PaperTrade | None
+    def state(self) -> Dict[str, Any]
+    def daily_report(self) -> Dict[str, Any]
+    def weekly_report(self) -> Dict[str, Any]
+    def monthly_report(self) -> Dict[str, Any]
+```
+
+Martingale is NOT implemented and must never be added: `RiskManager` keeps a
+fixed `risk_per_trade` fraction and refuses to increase stake after losses.
