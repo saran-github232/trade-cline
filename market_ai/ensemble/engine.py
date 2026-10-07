@@ -73,8 +73,15 @@ def disagreement_score(signals: Sequence[Signal]) -> float:
         return 0.0
     centre = sum(p * w for p, w in usable) / total_w
     var = sum(w * (p - centre) ** 2 for p, w in usable) / total_w
-    # A std-dev of 0.5 is the theoretical maximum for probabilities in [0,1].
-    return clamp(math.sqrt(var) / 0.5)
+    spread = clamp(math.sqrt(var) / 0.5)  # 0.5 is the max std-dev for [0,1]
+
+    # Spread alone is not disagreement.  Two providers that both admit they
+    # have no idea should not manufacture a conflict, so we scale by how much
+    # confidence mass is actually on the table relative to a fully-confident
+    # panel of the same size.  Without this, {0.9 @ 0.01, 0.1 @ 0.01} would
+    # score as maximum disagreement while carrying almost no information.
+    mass_factor = clamp(total_w / float(len(usable)))
+    return clamp(spread * mass_factor)
 
 
 def agreement_score(signals: Sequence[Signal]) -> float:

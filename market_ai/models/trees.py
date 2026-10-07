@@ -122,3 +122,180 @@ class DecisionTreeModel(BaseModel):
             self._importance = [v / total for v in self._importance]
         self._fitted = True
         return self
+
+    # -- split search helpers ---------------------------------------------
+    def _compute_edges(self, X: List[List[float]]) -> List[List[float]]:
+        """Pre-bin every feature into at most ``max_bins`` quantile buckets.
+
+        Returns, per feature, the strictly increasing internal edges.  A
+        feature that is constant (or has fewer than two distinct values) gets
+        no edges and therefore can never be chosen for a split.
+        """
+        b = max(2, self.max_bins)
+        edges: List[List[float]] = []
+        for j in range(self._n_features):
+            col = sorted(r[j] for r in X if math.isfinite(r[j]))
+            if len(col) < 2 or col[0] == col[-1]:
+                edges.append([])
+                continue
+            raw = []
+            for k in range(1, b):
+                q = _quantile(col, k / b)
+                if math.isfinite(q):
+                    raw.append(q)
+            deduped: List[float] = []
+            for e in raw:
+                if not deduped or e > deduped[-1]:
+                    deduped.append(e)
+            edges.append(deduped)
+        return edges
+
+    def _candidate_features(self) -> List[int]:
+        """Return the feature indices considered at the current node."""
+        d = self._n_features
+        mf = self.max_features
+        if mf is None or (isinstance(mf, str) and mf == "all"):
+            return list(range(d))
+        if mf == "sqrt":
+            k = max(1, int(math.sqrt(d)))
+        elif mf == "log2":
+            k = max(1, int(math.log2(d))) if d > 1 else 1
+        elif isinstance(mf, float):
+            k = max(1, int(round(mf * d)))
+        else:
+            k = max(1, min(d, int(mf)))
+        if k >= d:
+            return list(range(d))
+        return self._rng.sample(range(d), k)
+
+    def _impurity(self, pos_w: float, total_w: float) -> float:
+        """Weighted Gini or entropy impurity for a two-class node."""
+        if total_w <= 0.0:
+            return 0.0
+        p = pos_w / total_w
+        if self.criterion == "entropy":
+            out = 0.0
+            if p > 0.0:
+                out -= p * math.log2(p)
+            if p < 1.0:
+                out -= (1.0 - p) * math.log2(1.0 - p)
+            return out
+        return 2.0 * p * (1.0 - p)  # Gini = 1 - p^2 - (1-p)^2
+
+    def _find_split(
+        self,
+        indices: List[int],
+        X: List[List[float]],
+        y: List[int],
+        w: List[float],
+    ) -> Optional[tuple]:
+        """Find the best ``(feature, threshold)`` split using histograms.
+
+        Also accumulates the impurity decrease into ``self._importance`` so
+        importance is computed in a single pass over the tree.
+        """
+        n = len(indices)
+        tw = 0.0
+        tp = 0.0
+        for i in indices:
+            tw += w[i]
+            if y[i] == 1:
+                tp += w[i]
+        if tw <= 0.0:
+            return None
+        parent = self._impurity(tp, tw)
+        best_gain = 0.0
+        best: Optional[tuple] = None
+        for f in self._candidate_features():
+            es = self._edges[f]
+            if not es:
+                continue
+            n_bins = len(es) + 1
+            hist_w = [0.0] * n_bins
+            hist_p = [0.0] * n_bins
+            hist_n = [0] * n_bins
+            for i in indices:
+                b = bisect_right(es, X[i][f])
+                hist_w[b] += w[i]
+                hist_n[b] += 1
+                if y[i] == 1:
+                    hist_p[b] += w[i]
+            wl = 0.0
+            pl = 0.0
+            nl = 0
+            for b in range(n_bins - 1):
+                wl += hist_w[b]
+                pl += hist_p[b]
+                nl += hist_n[b]
+                nr = n - nl
+                if nl < self.min_samples_leaf or nr < self.min_samples_leaf:
+                    continue
+                wr = tw - wl
+                if wl <= 0.0 or wr <= 0.0:
+                    continue
+                imp_l = self._impurity(pl, wl)
+                imp_r = self._impurity(tp - pl, wr)
+                gain = parent - (wl / tw) * imp_l - (wr / tw) * imp_r
+                if gain > best_gain + 1e-12:
+                    best_gain = gain
+                    best = (f, es[b])
+        if best is not None:
+            self._importance[best[0]] += best_gain * n
+            return best
+        return None
+
+
+    def _build(
+        self,
+        indices: List[int],
+        X: List[List[float]],
+        y: List[int],
+        w: List[float],
+        depth: int,
+    ) -> _TreeNode:
+        """Recursively grow the tree from ``indices``."""
+        n = len(indices)
+        tw = 0.0
+        tp = 0.0
+        for i in indices:
+            tw += w[i]
+            if y[i] == 1:
+                tp += w[i]
+        prob = (tp / tw) if tw > 0.0 else 0.0
+        node = _TreeNode(prob, n)
+        # Stop conditions: depth, size, or a pure node (no impurity to remove).
+        if (
+            depth >= self.max_depth
+            or n < self.min_samples_split
+            or n < 2 * self.min_samples_leaf
+            or tp <= 0.0
+            or tp >= tw
+        ):
+            return node
+        best = self._find_split(indices, X, y, w)
+        if best is None:
+            return node
+        f, thr = best
+        left = [i for i in indices if X[i][f] < thr]
+        right = [i for i in indices if X[i][f] >= thr]
+        if len(left) < self.min_samples_leaf or len(right) < self.min_samples_leaf:
+            return node
+        node.feature = f
+        node.threshold = thr
+        node.left = self._build(left, X, y, w, depth + 1)
+        node.right = self._build(right, X, y, w, depth + 1)
+        return node
+
+    def predict_proba(self, X: Sequence[Sequence[float]]) -> List[float]:
+        """Return the leaf class-1 frequency for each row."""
+        Xp = self._prepare_predict(X)
+        if self._single_class and self._constant_prob is not None:
+            return [float(self._constant_prob)] * len(Xp)
+        out: List[float] = []
+        for xi in Xp:
+            node = self._root
+            while node is not None and node.feature is not None:
+                node = node.left if xi[node.feature] < node.threshold else node.right
+            out.append(float(node.prob) if node is not None else 0.0)
+        return out
+

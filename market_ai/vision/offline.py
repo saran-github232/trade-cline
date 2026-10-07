@@ -201,6 +201,16 @@ class OfflineChartAnalyser:
             resistance=resistance,
             breakout_probability=breakout,
             reversal_probability=reversal,
+            momentum=momentum,
+            volatility=volatility,
+            confidence=confidence,
+            invalidating_conditions=invalidating,
+            reasoning_summary=reasoning,
+            provider="offline",
+            degraded=False,
+            raw=raw,
+        )
+
 
     # -- classification helpers ------------------------------------------
     @staticmethod
@@ -331,15 +341,6 @@ class OfflineChartAnalyser:
             return "low"
         return "normal"
 
-            momentum=momentum,
-            volatility=volatility,
-            confidence=confidence,
-            invalidating_conditions=invalidating,
-            reasoning_summary=reasoning,
-            provider="offline",
-            degraded=False,
-            raw=raw,
-        )
 
 
     def _direction_bias(
