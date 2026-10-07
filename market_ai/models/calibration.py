@@ -124,3 +124,111 @@ class Calibrator:
             xs, ys = [0.0, 1.0], [0.0, 1.0]
         self._x = xs
         self._y = ys
+
+    def transform(self, probs: Sequence[float]) -> List[float]:
+        """Return calibrated probabilities for raw ``probs``."""
+        if not self._fitted:
+            raise ValueError("Calibrator must be fitted before transform")
+        out: List[float] = []
+        for v in probs:
+            p = _clamp(to_float(v))
+            if self.method == "platt":
+                out.append(sigmoid(self._a * p + self._b))
+            else:
+                out.append(self._interp(p))
+        return out
+
+    def _interp(self, p: float) -> float:
+        """Piecewise-linear interpolation of the isotonic fit, clamped at ends."""
+        xs, ys = self._x, self._y
+        if p <= xs[0]:
+            return ys[0]
+        if p >= xs[-1]:
+            return ys[-1]
+        lo = bisect_right(xs, p) - 1
+        if lo < 0:
+            return ys[0]
+        if lo >= len(xs) - 1:
+            return ys[-1]
+        x0, x1 = xs[lo], xs[lo + 1]
+        y0, y1 = ys[lo], ys[lo + 1]
+        if x1 <= x0:
+            return y1
+        t = (p - x0) / (x1 - x0)
+        return _clamp(y0 + (y1 - y0) * t)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialise the calibrator to a plain, pickle-free dict."""
+        payload: Dict[str, Any] = {"method": self.method, "fitted": self._fitted}
+        if self.method == "platt":
+            payload["a"] = self._a
+            payload["b"] = self._b
+        else:
+            payload["x"] = list(self._x)
+            payload["y"] = list(self._y)
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "Calibrator":
+        """Rebuild a calibrator from :meth:`to_dict` output."""
+        calibrator = cls(method=str(payload.get("method", "platt")))
+        if calibrator.method == "platt":
+            calibrator._a = float(payload.get("a", 1.0))
+            calibrator._b = float(payload.get("b", 0.0))
+        else:
+            calibrator._x = [float(v) for v in payload.get("x", [])]
+            calibrator._y = [float(v) for v in payload.get("y", [])]
+        calibrator._fitted = bool(payload.get("fitted", True))
+        return calibrator
+
+
+def calibration_report(
+    probs: Sequence[float], y: Sequence[int], n_bins: int = 10
+) -> Dict[str, Any]:
+    """Summarise calibration quality with a reliability curve and scores.
+
+    Returns a dict with ``bins`` (one entry per equal-width probability bucket,
+    each holding its count, average confidence, average outcome and gap), plus
+    ``ece``, ``brier``, ``log_loss`` and the sample count ``n``.  The three
+    scalar metrics are delegated to :mod:`market_ai.utils.stats` so they are
+    consistent with every other report in the system.
+    """
+    ps = [_clamp(to_float(v)) for v in probs]
+    ys = [1 if to_float(v) >= 0.5 else 0 for v in y]
+    if len(ps) != len(ys):
+        raise ValueError("probs and y must have the same length")
+    n_bins = max(1, int(n_bins))
+    pairs = list(zip(ps, ys))
+    buckets: List[List] = [[] for _ in range(n_bins)]
+    for p, o in pairs:
+        idx = min(int(p * n_bins), n_bins - 1)
+        buckets[idx].append((p, o))
+
+    bins: List[Dict[str, Any]] = []
+    for b, bucket in enumerate(buckets):
+        if bucket:
+            avg_prob = sum(p for p, _ in bucket) / len(bucket)
+            avg_out = sum(o for _, o in bucket) / len(bucket)
+            gap = abs(avg_out - avg_prob)
+        else:
+            avg_prob = avg_out = gap = float("nan")
+        bins.append(
+            {
+                "index": b,
+                "lower": b / n_bins,
+                "upper": (b + 1) / n_bins,
+                "count": len(bucket),
+                "avg_prob": avg_prob,
+                "avg_outcome": avg_out,
+                "gap": gap,
+            }
+        )
+
+    return {
+        "bins": bins,
+        "ece": _ece(ps, ys, n_bins),
+        "brier": _brier(ps, ys),
+        "log_loss": _log_loss(ps, ys),
+        "n": len(pairs),
+    }
+
